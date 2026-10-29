@@ -36,6 +36,61 @@ fn configure(d: &mut Encoder, h: &mut TestHost, stream: bool) {
         write(d, h, 0xfff62000 + o, v);
     }
 }
+// ImageMagick 7.1.2-27 Q16-HDRI `magick -size 36x22 gradient:black-white -strip -quality 60
+// jpeg:out.jpg`: baseline 8-bit single-component 36x22, 197 bytes, sha256
+// f17324773f37349248950a6d0f471e97b0a297ca5c8c21f25dc804ac78b53c8f.
+const JPEG_36X22: &[u8] = b"\xff\xd8\xff\xe0\x00\x10\x4a\x46\x49\x46\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xdb\x00\x43\x00\x0d\x09\x0a\x0b\x0a\x08\x0d\x0b\x0a\x0b\x0e\x0e\x0d\x0f\x13\x20\x15\x13\x12\x12\x13\x27\x1c\x1e\x17\x20\x2e\x29\x31\x30\x2e\x29\x2d\x2c\x33\x3a\x4a\x3e\x33\x36\x46\x37\x2c\x2d\x40\x57\x41\x46\x4c\x4e\x52\x53\x52\x32\x3e\x5a\x61\x5a\x50\x60\x4a\x51\x52\x4f\xff\xc0\x00\x0b\x08\x00\x16\x00\x24\x01\x01\x11\x00\xff\xc4\x00\x15\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x06\xff\xc4\x00\x18\x10\x00\x03\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x15\x62\x03\x61\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00\x8a\x53\x21\x4c\x85\x32\x14\xc8\x53\x25\xe2\x99\x0a\x64\x29\x90\xa6\x42\x99\x2e\x57\x67\xc0\xbb\x3e\x05\xd9\xf0\x2e\xcf\x81\x76\x7c\x3f\xff\xd9";
+const JPEG_SOURCE: u64 = 0x9000;
+// Row samples of JPEG_36X22 from the same ImageMagick, `-define jpeg:dct-method=islow` to
+// `gray:-`. Every column of a row is equal; islow, ifast and float differ by at most 1.
+const LUMA_36X22: [u8; 22] = [
+    1, 10, 24, 36, 47, 60, 73, 83, 98, 108, 122, 134, 145, 157, 171, 181, 194, 206, 220, 232, 243,
+    253,
+];
+// That islow decode through `-filter box -resize 18x11!`.
+const LUMA_18X11: [u8; 11] = [6, 30, 54, 78, 103, 128, 151, 176, 200, 226, 248];
+fn jpeg_decoder() -> Decoder {
+    Decoder::new(
+        decoder::Options {
+            completion_ticks: 5,
+            reset_ticks: 2,
+        },
+        Irq { core: 0, line: 76 },
+    )
+    .unwrap()
+}
+fn load_jpeg(h: &mut TestHost) {
+    h.ram[JPEG_SOURCE as usize..JPEG_SOURCE as usize + JPEG_36X22.len()]
+        .copy_from_slice(JPEG_36X22);
+}
+fn start_jpeg(d: &mut Decoder, h: &mut TestHost, destination: u32, capacity: u32, shift: u32) {
+    for (o, v) in [
+        (8, 0xfd0020),
+        (0xa0, shift),
+        (0x100, destination),
+        (0x104, capacity),
+        (0x10c, JPEG_SOURCE as u32),
+        (0x110, JPEG_36X22.len() as u32),
+        (0, 1),
+    ] {
+        write(d, h, 0xfff63000 + o, v);
+    }
+}
+/// `luma` holds one value per decoded row, matched within 1; pitch and row padding must be zero.
+fn assert_gray_packed422(out: &[u8], pitch: usize, width: usize, luma: &[u8]) {
+    for (y, row) in out.chunks_exact(pitch * 2).enumerate() {
+        for (x, pair) in row.chunks_exact(4).enumerate() {
+            if y < luma.len() && x * 2 < width {
+                assert_eq!(&pair[2..], &[128, 128], "chroma pair {x} row {y}");
+                for v in &pair[..2] {
+                    assert!(v.abs_diff(luma[y]) <= 1, "luma {v} pair {x} row {y}");
+                }
+            } else {
+                assert_eq!(pair, &[0; 4], "padding pair {x} row {y}");
+            }
+        }
+    }
+}
 #[test]
 fn memory_encode_reserves_prefix_and_decoder_publishes_pixels_before_irq() {
     let mut h = TestHost::new();
@@ -75,7 +130,8 @@ fn memory_encode_reserves_prefix_and_decoder_publishes_pixels_before_irq() {
     advance_from_checkpoint(&mut decoder, &mut h, 15);
     assert_eq!(&h.ram[0xa000..0xa004], &[128, 128, 128, 128]);
     assert_eq!(h.irqs, [(0, 77), (0, 76)]);
-    assert_eq!(read(&mut decoder, &mut h, 0xfff63108), count as u64);
+    // 16x8 packed422 at pitch 16 writes 256 bytes.
+    assert_eq!(read(&mut decoder, &mut h, 0xfff63108), 0xa000 + 16 * 8 * 2);
     write(&mut decoder, &mut h, 0xfff63004, 16);
     assert_eq!(read(&mut decoder, &mut h, 0xfff63004), 0);
     write(&mut decoder, &mut h, 0xfff63118, 1);
@@ -178,6 +234,187 @@ fn programmed_restart_nine_reaches_the_real_codestream_and_decoder() {
     assert!(rgb.iter().all(|v| (127..=129).contains(v)));
     assert_eq!(h.effects, ["dma", "irq"]);
     assert_eq!(h.irqs, [(0, 77)]);
+}
+
+#[test]
+fn jpeg_completion_cursor_is_the_padded_extent_of_the_programmed_destination() {
+    let mut h = TestHost::new();
+    h.ram[0x80000..0x82000].fill(0xa5);
+    load_jpeg(&mut h);
+    let mut d = jpeg_decoder();
+    start_jpeg(&mut d, &mut h, 0x4008_0000, 0x1000, 0);
+    advance(&mut d, &mut h, 5);
+    assert_eq!(h.effects, ["dma", "irq"]);
+    assert_eq!(h.irqs, [(0, 76)]);
+    let programmed = read(&mut d, &mut h, 0xfff63100);
+    assert_eq!(programmed, 0x4008_0000);
+    let cursor = read(&mut d, &mut h, 0xfff63108);
+    assert_eq!(cursor - programmed, 48 * 24 * 2);
+    assert_eq!(read(&mut d, &mut h, 0xfff63110), JPEG_36X22.len() as u64);
+    assert_gray_packed422(&h.ram[0x80000..][..48 * 24 * 2], 48, 36, &LUMA_36X22);
+    assert_eq!(&h.ram[0x80000 + 48 * 24 * 2..][..4], &[0xa5; 4]);
+}
+
+#[test]
+fn jpeg_downscale_cursor_uses_the_scaled_padded_extent() {
+    let mut h = TestHost::new();
+    h.ram[0x80000..0x82000].fill(0xa5);
+    load_jpeg(&mut h);
+    let mut d = jpeg_decoder();
+    start_jpeg(&mut d, &mut h, 0x4008_1000, 0x1000, 1);
+    advance(&mut d, &mut h, 5);
+    assert_eq!(h.irqs, [(0, 76)]);
+    assert_eq!(read(&mut d, &mut h, 0xfff63108) - 0x4008_1000, 32 * 16 * 2);
+    assert_gray_packed422(&h.ram[0x81000..][..32 * 16 * 2], 32, 18, &LUMA_18X11);
+    assert_eq!(&h.ram[0x81000 + 32 * 16 * 2..][..4], &[0xa5; 4]);
+}
+
+#[test]
+fn jpeg_cursor_wraps_with_the_raw_alias_where_the_extent_ends_the_aperture() {
+    // physical() admits an extent ending exactly at 0x4000_0000.
+    let mut h = TestHost {
+        ram: vec![0; 0x4000_0000],
+        ..TestHost::new()
+    };
+    load_jpeg(&mut h);
+    let mut d = jpeg_decoder();
+    let start = 0x4000_0000 - 48 * 24 * 2;
+    start_jpeg(&mut d, &mut h, 0xc000_0000 | start as u32, 48 * 24 * 2, 0);
+    advance(&mut d, &mut h, 5);
+    assert_eq!(h.irqs, [(0, 76)]);
+    let programmed = read(&mut d, &mut h, 0xfff63100) as u32;
+    let cursor = read(&mut d, &mut h, 0xfff63108) as u32;
+    assert_eq!((programmed, cursor), (0xffff_f700, 0));
+    assert_eq!(cursor.wrapping_sub(programmed), 48 * 24 * 2);
+    assert_gray_packed422(&h.ram[start..], 48, 36, &LUMA_36X22);
+}
+
+#[test]
+fn unsuccessful_jpeg_dma_publishes_no_completion_cursor_or_irq() {
+    let mut h = TestHost::new();
+    load_jpeg(&mut h);
+    let mut d = jpeg_decoder();
+    // 0x4030_0000 normalizes into the alias aperture but past this host's 1 MiB.
+    start_jpeg(&mut d, &mut h, 0x4030_0000, 0x1000, 0);
+    for now in [5, 6] {
+        h.now = now;
+        let mut cx = h.cx();
+        d.advance(&mut cx);
+        assert!(cx.refusal().is_some());
+        assert_eq!(read(&mut d, &mut h, 0xfff63108), 0);
+        assert_eq!(read(&mut d, &mut h, 0xfff63004), 0);
+        assert!(h.effects.is_empty());
+        assert_eq!(d.next_deadline(now), Some(5));
+    }
+}
+
+#[test]
+fn jpeg_checkpoint_resumes_the_pending_cursor_and_bytes_once() {
+    let mut h = TestHost::new();
+    h.ram[0x80000..0x82000].fill(0xa5);
+    load_jpeg(&mut h);
+    let mut d = jpeg_decoder();
+    start_jpeg(&mut d, &mut h, 0x4008_0000, 0x1000, 0);
+    // Staged pixels and source remain byte strings and blobs, not integer arrays.
+    assert!(d.checkpoint().unwrap().bytes() < JPEG_36X22.len() + 48 * 24 * 2 + 512);
+    advance_from_checkpoint(&mut d, &mut h, 5);
+    assert_eq!(read(&mut d, &mut h, 0xfff63108), 0x4008_0000 + 48 * 24 * 2);
+    assert_eq!(h.effects, ["dma", "irq"]);
+    assert_eq!(h.irqs, [(0, 76)]);
+    assert_eq!(d.next_deadline(5), None);
+    assert_gray_packed422(&h.ram[0x80000..][..48 * 24 * 2], 48, 36, &LUMA_36X22);
+    assert_eq!(&h.ram[0x80000 + 48 * 24 * 2..][..4], &[0xa5; 4]);
+}
+
+#[test]
+fn checkpoint_holding_a_legacy_input_count_is_refused_and_the_job_completes_once() {
+    use fujimod_emulator_devices::checkpoint::Checkpoint;
+    use fujimod_emulator_imaging::exr2_isp::dma::Transfer;
+    #[derive(serde::Deserialize)]
+    struct Saved {
+        r: Vec<u32>,
+        dma: Transfer,
+        source: usize,
+    }
+    /// Pending decode whose completion published the input count to 0x108.
+    #[derive(serde::Serialize)]
+    enum LegacyPending {
+        Decode(u32),
+    }
+    #[derive(serde::Serialize)]
+    struct Legacy<'a> {
+        r: &'a [u32],
+        dma: &'a Transfer,
+        pending: Option<LegacyPending>,
+        source: usize,
+    }
+    let mut h = TestHost::new();
+    h.ram[0x80000..0x82000].fill(0xa5);
+    load_jpeg(&mut h);
+    let mut d = jpeg_decoder();
+    start_jpeg(&mut d, &mut h, 0x4008_0000, 0x1000, 0);
+    let name = d.name();
+    let saved = d.checkpoint().unwrap();
+    let Saved { r, dma, source } = saved.decode(name).unwrap();
+    let legacy = |pending: Option<LegacyPending>| {
+        let state = Legacy {
+            r: &r,
+            dma: &dma,
+            pending,
+            source,
+        };
+        Checkpoint::encode(name, &state)
+            .unwrap()
+            .with_blobs(saved.blobs().to_vec())
+    };
+    d.validate_checkpoint(&legacy(None)).unwrap();
+    let count = legacy(Some(LegacyPending::Decode(JPEG_36X22.len() as u32)));
+    assert!(d.validate_checkpoint(&count).is_err());
+    assert!(d.restore_checkpoint(&count).is_err());
+    advance(&mut d, &mut h, 5);
+    advance(&mut d, &mut h, 6);
+    assert_eq!(read(&mut d, &mut h, 0xfff63108), 0x4008_0000 + 48 * 24 * 2);
+    assert_eq!(h.effects, ["dma", "irq"]);
+    assert_eq!(h.irqs, [(0, 76)]);
+    assert_gray_packed422(&h.ram[0x80000..][..48 * 24 * 2], 48, 36, &LUMA_36X22);
+}
+
+#[test]
+fn reset_is_refused_while_pending_and_retains_the_completed_cursor() {
+    let mut h = TestHost::new();
+    h.ram[0x80000..0x82000].fill(0xa5);
+    load_jpeg(&mut h);
+    let mut d = jpeg_decoder();
+    start_jpeg(&mut d, &mut h, 0x4008_0000, 0x1000, 0);
+    let mut cx = h.cx();
+    d.write(&mut cx, 0xfff63118, 4, 1);
+    assert!(cx.refusal().is_some());
+    assert_eq!(d.next_deadline(0), Some(5));
+    assert_eq!(read(&mut d, &mut h, 0xfff63118), 0);
+    assert!(h.irqs.is_empty());
+    assert!(h.ram[0x80000..0x82000].iter().all(|&v| v == 0xa5));
+    advance(&mut d, &mut h, 5);
+    let first = read(&mut d, &mut h, 0xfff63108);
+    assert_eq!(first, 0x4008_0000 + 48 * 24 * 2);
+    assert_eq!(h.irqs, [(0, 76)]);
+    assert_gray_packed422(&h.ram[0x80000..][..48 * 24 * 2], 48, 36, &LUMA_36X22);
+    write(&mut d, &mut h, 0xfff63004, 0x10);
+    assert_eq!(read(&mut d, &mut h, 0xfff63004), 0);
+    write(&mut d, &mut h, 0xfff63118, 1);
+    advance(&mut d, &mut h, 7);
+    assert_eq!(read(&mut d, &mut h, 0xfff63004), 0x10000);
+    assert_eq!(read(&mut d, &mut h, 0xfff63118), 0);
+    assert_eq!(read(&mut d, &mut h, 0xfff63108), first);
+    assert_eq!(h.irqs, [(0, 76)]);
+    start_jpeg(&mut d, &mut h, 0x4008_1000, 0x1000, 1);
+    assert_eq!(d.next_deadline(7), Some(12));
+    assert_eq!(read(&mut d, &mut h, 0xfff63108), first);
+    assert_eq!(&h.ram[0x81000..0x81004], &[0xa5; 4]);
+    advance(&mut d, &mut h, 12);
+    assert_eq!(read(&mut d, &mut h, 0xfff63108), 0x4008_1000 + 32 * 16 * 2);
+    assert_eq!(read(&mut d, &mut h, 0xfff63004), 0x10010);
+    assert_eq!(h.irqs, [(0, 76), (0, 76)]);
+    assert_gray_packed422(&h.ram[0x81000..][..32 * 16 * 2], 32, 18, &LUMA_18X11);
 }
 
 #[test]

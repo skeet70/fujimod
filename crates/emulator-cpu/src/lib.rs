@@ -204,6 +204,45 @@ pub enum Access {
     Fetch,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataAccess {
+    Read,
+    Write,
+}
+impl From<DataAccess> for Access {
+    fn from(access: DataAccess) -> Self {
+        match access {
+            DataAccess::Read => Self::Read,
+            DataAccess::Write => Self::Write,
+        }
+    }
+}
+/// Physical address of a guest access, as `Hook::Memory` reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PhysicalAddress(pub u64);
+/// Why [`Cpu::refuse_access`] did not refuse an access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessRefusalError {
+    /// The backend does not advertise [`Features::access_refusal`].
+    Unsupported,
+    /// No native `Hook::Memory` callback is running.
+    OutsideMemoryHook,
+    /// The engine tests exits only at block entry or translates for
+    /// parallel processors.
+    UnsupportedExecutionMode,
+}
+impl std::fmt::Display for AccessRefusalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unsupported => "backend cannot refuse memory accesses",
+            Self::OutsideMemoryHook => "access refusal is valid only inside a memory hook",
+            Self::UnsupportedExecutionMode => {
+                "access refusal requires per-access exits and non-parallel translation"
+            }
+        })
+    }
+}
+impl std::error::Error for AccessRefusalError {}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Interrupt {
     Irq,
     Fiq,
@@ -343,6 +382,11 @@ pub enum Exit {
 pub enum ExecutionError {
     InvalidInstruction(String),
     Memory { fault: Fault, message: String },
+    /// A memory hook refused this access with [`Cpu::refuse_access`].
+    AccessRefused {
+        access: DataAccess,
+        address: PhysicalAddress,
+    },
     Backend(String),
 }
 impl ExecutionError {
@@ -357,6 +401,7 @@ impl ExecutionError {
                 Fault::WriteProtected => "write-protected",
                 Fault::FetchProtected => "fetch-protected",
             },
+            Self::AccessRefused { .. } => "access-refused",
             Self::Backend(_) => "backend",
         }
     }
@@ -367,6 +412,15 @@ impl std::fmt::Display for ExecutionError {
             Self::InvalidInstruction(message)
             | Self::Memory { message, .. }
             | Self::Backend(message) => f.write_str(message),
+            Self::AccessRefused { access, address } => write!(
+                f,
+                "memory hook refused the {} at {:#x}",
+                match access {
+                    DataAccess::Read => "read",
+                    DataAccess::Write => "write",
+                },
+                address.0
+            ),
         }
     }
 }
@@ -404,6 +458,9 @@ pub struct Features {
     pub watched_stores: bool,
     pub backing_observation: bool,
     pub store_pc_control: bool,
+    /// [`Cpu::refuse_access`] refuses accesses from native `Hook::Memory`
+    /// callbacks.
+    pub access_refusal: bool,
 }
 #[derive(Clone, Copy, Debug)]
 pub enum HookRange {
@@ -721,6 +778,14 @@ pub trait Cpu {
     /// Valid only inside an instruction observer, before any guest effects.
     fn stop_before_instruction(&self) -> Result<(), String> {
         Err("backend cannot intercept an instruction entry".into())
+    }
+    /// Refuse the access the running `Hook::Memory` callback observes. After
+    /// the callback returns, no later hook sees the access, neither it nor
+    /// the rest of its instruction happens, and `run` returns
+    /// [`ExecutionError::AccessRefused`] with the PC naming the instruction.
+    /// Earlier accesses of the instruction remain.
+    fn refuse_access(&self) -> Result<(), AccessRefusalError> {
+        Err(AccessRefusalError::Unsupported)
     }
     /// Declared R-profile CP14 identity input, changed only while paused.
     fn rprofile_identity(&self, _value: Option<u32>) -> Result<u32, String> {

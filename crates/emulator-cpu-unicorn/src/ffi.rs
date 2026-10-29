@@ -8,6 +8,9 @@ pub type Context = *mut c_void;
 pub type Error = c_int;
 pub const FEATURE_PAUSE_ACCOUNTING_LAYOUT: u32 = 1 << 3;
 pub const FEATURE_PARALLEL_TCG: u32 = 1 << 4;
+pub const FEATURE_ACCESS_REFUSAL: u32 = 1 << 5;
+pub const ERR_MODE: Error = 4;
+pub const ERR_EMBEDDER_REFUSED: Error = 23;
 pub const fn ctl(kind: u32, count: u32, direction: u32) -> u32 {
     kind | (count << 26) | (direction << 30)
 }
@@ -44,6 +47,8 @@ pub struct Extensions {
     >,
     pub retry_block: Option<unsafe extern "C" fn(Engine, u32) -> Error>,
     pub request_restart: Option<unsafe extern "C" fn(Engine) -> Error>,
+    /// From a read/write memory hook, refuse the access it observes.
+    pub refuse_access: Option<unsafe extern "C" fn(Engine) -> Error>,
     pub set_parallel_cpus: Option<unsafe extern "C" fn(Engine, bool) -> Error>,
     /// Test exit requests only at block entry; hook exits stay immediate.
     pub set_block_exits: Option<unsafe extern "C" fn(Engine, bool) -> Error>,
@@ -192,6 +197,7 @@ mod linked {
         ) -> Error;
         fn uc_embedder_retry_block(engine: Engine, count: u32) -> Error;
         fn uc_embedder_request_restart(engine: Engine) -> Error;
+        fn uc_embedder_refuse_access(engine: Engine) -> Error;
         fn uc_embedder_set_parallel_cpus(engine: Engine, enabled: bool) -> Error;
         fn uc_embedder_set_block_exits(engine: Engine, enabled: bool) -> Error;
         fn uc_embedder_accounting(engine: Engine) -> *mut Accounting;
@@ -208,6 +214,7 @@ mod linked {
             insn_filter: Some(uc_embedder_set_insn_filter),
             retry_block: Some(uc_embedder_retry_block),
             request_restart: Some(uc_embedder_request_restart),
+            refuse_access: Some(uc_embedder_refuse_access),
             set_parallel_cpus: Some(uc_embedder_set_parallel_cpus),
             set_block_exits: Some(uc_embedder_set_block_exits),
             accounting: Some(uc_embedder_accounting),

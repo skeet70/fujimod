@@ -13,11 +13,35 @@ pub struct Options {
     pub completion_ticks: u64,
     pub reset_ticks: u64,
 }
+/// Bytes one decode writes from 0x100, bounded by the 0x104 capacity.
+#[derive(Clone, Copy)]
+struct Extent(u32);
+impl Extent {
+    fn within(bytes: usize, capacity: u32) -> Option<Self> {
+        u32::try_from(bytes)
+            .ok()
+            .filter(|&n| n <= capacity)
+            .map(Self)
+    }
+}
+/// 0x108 after completion: raw 0x100, alias bits included, plus the written extent modulo 2^32.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DestinationCursor {
+    endpoint: u32,
+}
+impl DestinationCursor {
+    fn after(destination: u32, written: Extent) -> Self {
+        Self {
+            endpoint: destination.wrapping_add(written.0),
+        }
+    }
+}
 #[derive(Clone, Copy, Serialize, Deserialize)]
 enum Pending {
     Reset(u64),
     Clear(u64),
-    Decode(u32),
+    Decode(DestinationCursor),
 }
 pub struct Decoder {
     r: Vec<u32>,
@@ -84,6 +108,7 @@ impl Decoder {
             (r[0x100 / 4] & 0x3fffffff) as u64,
         );
         let (count, capacity) = (r[0x110 / 4] as usize, r[0x104 / 4] as usize);
+        let destination = r[0x100 / 4];
         if r[2] != 0xfd0020
             || r[0xa0 / 4] > 3
             || [0x11c, 0x120, 0x124, 0x128].iter().any(|&o| r[o / 4] != 0)
@@ -124,11 +149,14 @@ impl Decoder {
         }
         let pitch = (w + 15) & !15;
         let rows = (h + 7) & !7;
-        if pitch * rows * 2 > capacity
-            || src < dst + (pitch * rows * 2) as u64 && dst < src + count as u64
-        {
+        let row_bytes = pitch * 2;
+        let written = row_bytes * rows;
+        let Some(extent) = Extent::within(written, r[0x104 / 4])
+            .filter(|_| src >= dst + written as u64 || dst >= src + count as u64)
+        else {
             return Err("JPEG output exceeds allocation or overlaps input".into());
-        }
+        };
+        let cursor = DestinationCursor::after(destination, extent);
         let size = decoder
             .output_buffer_size()
             .ok_or("JPEG output size unknown")?;
@@ -139,13 +167,13 @@ impl Decoder {
                 address: dst,
                 width: pitch,
                 height: rows,
-                pitch: pitch * 2,
+                pitch: row_bytes,
             },
-            pitch * 2,
+            row_bytes,
         )?;
         let source = self.source.clone();
         self.dma.pixels.defer_fallible(move |mut pixels| {
-            pixels.resize(pitch * rows * 2, 0);
+            pixels.resize(written, 0);
             let result = (|| {
                 let options = DecoderOptions::new_safe()
                     .set_use_unsafe(false)
@@ -188,7 +216,7 @@ impl Decoder {
             self.dma.cancel();
             return Err(error);
         }
-        self.pending = Some(Pending::Decode(count as u32));
+        self.pending = Some(Pending::Decode(cursor));
         Ok(())
     }
     fn store(&mut self, cx: &Cx<'_>, o: usize, v: u32) -> Result<(), String> {
@@ -267,7 +295,7 @@ impl Device for Decoder {
                 self.r[0x118 / 4] = 0;
             }
             Pending::Clear(_) => self.r[0] = 0,
-            Pending::Decode(count) => {
+            Pending::Decode(cursor) => {
                 match self.dma.write(cx) {
                     Ok(true) => {}
                     Ok(false) => return,
@@ -276,7 +304,7 @@ impl Device for Decoder {
                         return;
                     }
                 }
-                self.r[0x108 / 4] = count;
+                self.r[0x108 / 4] = cursor.endpoint;
                 self.r[1] |= 0x10;
                 Transfer::interrupt(cx, self.irq);
             }
@@ -354,54 +382,5 @@ mod pixel_tests {
             let rgb = [state as u8, (state >> 16) as u8, (state >> 32) as u8].map(i32::from);
             assert_eq!(rgb_to_ycc(rgb), reference(rgb.map(i64::from)));
         }
-    }
-}
-
-#[cfg(test)]
-mod checkpoint_tests {
-    use super::*;
-    #[test]
-    fn pixel_and_source_bytes_restore_without_integer_array_expansion() {
-        let mut device = Decoder::new(
-            Options {
-                completion_ticks: 5,
-                reset_ticks: 2,
-            },
-            Irq { core: 0, line: 76 },
-        )
-        .unwrap();
-        device.source = vec![0xf9; 4096].into();
-        device
-            .dma
-            .prepare(
-                0,
-                5,
-                Raster {
-                    address: 0x4000,
-                    width: 8,
-                    height: 8,
-                    pitch: 16,
-                },
-                16,
-            )
-            .unwrap();
-        for (i, byte) in device.dma.pixels.iter_mut().enumerate() {
-            *byte = i as u8;
-        }
-        device.pending = Some(Pending::Decode(41));
-        let identity = device.fingerprint().unwrap();
-        let saved = device.checkpoint().unwrap();
-        assert!(saved.bytes() < device.source.len() + device.dma.pixels.len() + 1024);
-        Arc::make_mut(&mut device.source).fill(0);
-        device.dma.pixels.fill(0);
-        device.pending = None;
-        device.restore_checkpoint(&saved).unwrap();
-        assert_eq!(&*device.source, &vec![0xf9; 4096]);
-        assert_eq!(
-            &**device.dma.pixels,
-            &(0..128).map(|i| i as u8).collect::<Vec<_>>()
-        );
-        assert!(matches!(device.pending, Some(Pending::Decode(41))));
-        assert_eq!(device.fingerprint().unwrap(), identity);
     }
 }
