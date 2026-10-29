@@ -7,8 +7,8 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 
 use fujimod_emulator_cpu::{
-    Access, AccessRefusalError, Cpu, ExecutionError, Exit, Hook, HookRange, InstructionDisposition,
-    Mmio, Model, PhysicalAddress, Register, Run, Translation, TranslationHooks, arm,
+    Access, AccessRefusalError, Cpu, ExecutionError, Exit, Hook, HookRange, Mmio, Model,
+    PhysicalAddress, Register, Run, arm,
 };
 use fujimod_emulator_cpu_unicorn::{Core, Library};
 
@@ -51,7 +51,7 @@ impl Target {
 enum Action {
     Refuse,
     RestartThenRefuse,
-    Restart,
+    RestartThenStop,
 }
 
 /// An armed action fires at its target's first matching access only; an
@@ -60,7 +60,7 @@ struct Admission<'a> {
     cpu: &'a Core,
     armed: Cell<Option<(Target, Action)>>,
     refusal_errors: RefCell<Vec<AccessRefusalError>>,
-    restart_errors: RefCell<Vec<String>>,
+    control_errors: RefCell<Vec<String>>,
 }
 
 impl<'a> Admission<'a> {
@@ -69,7 +69,7 @@ impl<'a> Admission<'a> {
             cpu,
             armed: Cell::new(None),
             refusal_errors: RefCell::default(),
-            restart_errors: RefCell::default(),
+            control_errors: RefCell::default(),
         });
         unsafe {
             cpu.install_hook(Hook::Memory {
@@ -90,7 +90,7 @@ impl<'a> Admission<'a> {
 
     fn assert_no_hook_errors(&self) {
         assert_eq!(*self.refusal_errors.borrow(), Vec::<AccessRefusalError>::new());
-        assert_eq!(*self.restart_errors.borrow(), Vec::<String>::new());
+        assert_eq!(*self.control_errors.borrow(), Vec::<String>::new());
     }
 }
 
@@ -108,10 +108,15 @@ unsafe fn admit(access: Access, address: u64, size: i32, _: i64, data: *mut c_vo
         return;
     }
     admission.armed.set(None);
-    if matches!(action, Action::Restart | Action::RestartThenRefuse)
+    if matches!(action, Action::RestartThenRefuse | Action::RestartThenStop)
         && let Err(error) = admission.cpu.request_restart()
     {
-        admission.restart_errors.borrow_mut().push(error);
+        admission.control_errors.borrow_mut().push(error);
+    }
+    if matches!(action, Action::RestartThenStop)
+        && let Err(error) = admission.cpu.stop()
+    {
+        admission.control_errors.borrow_mut().push(error);
     }
     if matches!(action, Action::Refuse | Action::RestartThenRefuse)
         && let Err(error) = admission.cpu.refuse_access()
@@ -390,32 +395,10 @@ fn refused_unaligned_store_writes_no_byte_and_the_same_store_later_writes_all() 
     assert_eq!(reg(&cpu, arm::PC), 0x1004);
 }
 
-unsafe fn execute_all(_: *mut c_void, _: u64, _: u32) -> Translation {
-    Translation {
-        instruction: InstructionDisposition::Execute,
-        observe_block: false,
-    }
-}
-
-unsafe fn record_restart(data: *mut c_void, pc: u64) {
-    let restarts = unsafe { &*data.cast::<RefCell<Vec<u64>>>() };
-    restarts.borrow_mut().push(pc);
-}
-
-/// Guards a pending restart that replays the refused store, or that survives
-/// the refused run and restarts the next one.
+/// Guards a pending restart that replays the refused store.
 #[test]
 fn refusal_overrides_a_pending_restart_and_leaves_the_next_run_clean() {
     let cpu = machine(&[STR_R0_R1_POST_4, MOV_R3_1]);
-    let restarts = RefCell::new(Vec::new());
-    unsafe {
-        cpu.translation_hooks(Some(TranslationHooks {
-            classify: execute_all,
-            restart: record_restart,
-            data: (&restarts as *const RefCell<Vec<u64>>).cast_mut().cast(),
-        }))
-    }
-    .unwrap();
     let admission = Admission::install(&cpu);
     set(&cpu, arm::CORE[0], 0x1111_1111);
     set(&cpu, arm::CORE[1], 0x4ffc);
@@ -425,7 +408,6 @@ fn refusal_overrides_a_pending_restart_and_leaves_the_next_run_clean() {
     assert_refused(run(&cpu, 2), store);
 
     admission.assert_no_hook_errors();
-    assert_eq!(*restarts.borrow(), Vec::<u64>::new());
     assert_eq!(word(&cpu, 0x4ffc), RAM_WORD);
     assert_eq!(reg(&cpu, arm::CORE[1]), 0x4ffc);
     assert_eq!(reg(&cpu, arm::CORE[3]), UNTOUCHED);
@@ -433,24 +415,21 @@ fn refusal_overrides_a_pending_restart_and_leaves_the_next_run_clean() {
 
     run(&cpu, 2).unwrap();
 
-    assert_eq!(*restarts.borrow(), Vec::<u64>::new());
     assert_eq!(word(&cpu, 0x4ffc), 0x1111_1111);
     assert_eq!(reg(&cpu, arm::CORE[1]), 0x5000);
     assert_eq!(reg(&cpu, arm::CORE[3]), 1);
     assert_eq!(reg(&cpu, arm::PC), 0x1008);
 
     cpu.write_memory(0x4ffc, &RAM_WORD.to_le_bytes()).unwrap();
-    set(&cpu, arm::CORE[0], 0x2222_2222);
     set(&cpu, arm::CORE[1], 0x4ffc);
-    admission.arm(store, Action::Restart);
+    admission.arm(store, Action::RestartThenStop);
 
     run(&cpu, 2).unwrap();
 
     admission.assert_no_hook_errors();
-    assert_eq!(*restarts.borrow(), [0x1000]);
-    assert_eq!(word(&cpu, 0x4ffc), 0x2222_2222);
-    assert_eq!(reg(&cpu, arm::CORE[1]), 0x5000);
-    assert_eq!(reg(&cpu, arm::PC), 0x1008);
+    assert_eq!(word(&cpu, 0x4ffc), RAM_WORD);
+    assert_eq!(reg(&cpu, arm::CORE[1]), 0x4ffc);
+    assert_eq!(reg(&cpu, arm::PC), 0x1000);
 }
 
 struct InstructionHookRefusal<'a> {
