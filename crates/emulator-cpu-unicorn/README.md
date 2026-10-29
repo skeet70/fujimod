@@ -19,6 +19,8 @@ selection. The build refuses a cache that selects other guest architectures.
 
 Only the raw `Core` sets `Features::access_refusal`. A `Hook::Memory` callback calls `Cpu::refuse_access` to refuse the access it observes: later hooks, the access and its device callbacks, a requested restart and the rest of the instruction do not happen, and `run` returns `ExecutionError::AccessRefused` with the PC at the instruction. Earlier accesses of that instruction remain. Refusal requires the per-access exit checks and serial translation that `Library::open` selects, and fails with `UnsupportedExecutionMode` otherwise. The R-profile `Core` and other backends return `AccessRefusalError::Unsupported`.
 
+The raw `Core` permits same-core nested runs from callbacks. Each run has its own memory-hook scope and refused-access error details. Returning from a nested run restores any refusal and hook scope of the suspended run. An instruction callback in a nested run cannot refuse the suspended run's memory access.
+
 ## Exact loop execution
 
 Exact board runs use `LoopMode::Accelerate` by default. Select

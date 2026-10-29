@@ -682,7 +682,8 @@ impl Cpu for Core {
             self.run_until.set(request.until);
         }
         self.callback_error.borrow_mut().take();
-        self.refused_access.set(None);
+        let outer_access = self.memory_access.replace(None);
+        let outer_refused = self.refused_access.replace(None);
         let status = unsafe {
             (self.api.uc_emu_start)(
                 self.raw,
@@ -692,11 +693,13 @@ impl Cpu for Core {
                 request.instructions.unwrap_or(0),
             )
         };
+        let refused_access = self.refused_access.replace(outer_refused);
+        self.memory_access.set(outer_access);
         if let Some(error) = self.callback_error.borrow_mut().take() {
             return Err(ExecutionError::Backend(error));
         }
         if status == ffi::ERR_EMBEDDER_REFUSED
-            && let Some(MemoryAccess { access, address }) = self.refused_access.take()
+            && let Some(MemoryAccess { access, address }) = refused_access
         {
             return Err(ExecutionError::AccessRefused { access, address });
         }
