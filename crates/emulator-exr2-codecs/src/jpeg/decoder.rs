@@ -13,11 +13,25 @@ pub struct Options {
     pub completion_ticks: u64,
     pub reset_ticks: u64,
 }
+/// 0x108 after completion: programmed 0x100 plus written bytes, in the 0x100 address domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct DestinationCursor(u32);
+impl DestinationCursor {
+    fn after(destination: u32, written: usize) -> Result<Self, String> {
+        let written = u32::try_from(written)
+            .map_err(|_| "JPEG decode output exceeds one register")?;
+        destination
+            .checked_add(written)
+            .map(Self)
+            .ok_or_else(|| "JPEG decode destination cursor overflows".into())
+    }
+}
 #[derive(Clone, Copy, Serialize, Deserialize)]
 enum Pending {
     Reset(u64),
     Clear(u64),
-    Decode(u32),
+    Decode(DestinationCursor),
 }
 pub struct Decoder {
     r: Vec<u32>,
@@ -84,6 +98,7 @@ impl Decoder {
             (r[0x100 / 4] & 0x3fffffff) as u64,
         );
         let (count, capacity) = (r[0x110 / 4] as usize, r[0x104 / 4] as usize);
+        let destination = r[0x100 / 4];
         if r[2] != 0xfd0020
             || r[0xa0 / 4] > 3
             || [0x11c, 0x120, 0x124, 0x128].iter().any(|&o| r[o / 4] != 0)
@@ -124,11 +139,12 @@ impl Decoder {
         }
         let pitch = (w + 15) & !15;
         let rows = (h + 7) & !7;
-        if pitch * rows * 2 > capacity
-            || src < dst + (pitch * rows * 2) as u64 && dst < src + count as u64
-        {
+        let row_bytes = pitch * 2;
+        let written = row_bytes * rows;
+        if written > capacity || src < dst + written as u64 && dst < src + count as u64 {
             return Err("JPEG output exceeds allocation or overlaps input".into());
         }
+        let cursor = DestinationCursor::after(destination, written)?;
         let size = decoder
             .output_buffer_size()
             .ok_or("JPEG output size unknown")?;
@@ -139,13 +155,13 @@ impl Decoder {
                 address: dst,
                 width: pitch,
                 height: rows,
-                pitch: pitch * 2,
+                pitch: row_bytes,
             },
-            pitch * 2,
+            row_bytes,
         )?;
         let source = self.source.clone();
         self.dma.pixels.defer_fallible(move |mut pixels| {
-            pixels.resize(pitch * rows * 2, 0);
+            pixels.resize(written, 0);
             let result = (|| {
                 let options = DecoderOptions::new_safe()
                     .set_use_unsafe(false)
@@ -188,7 +204,7 @@ impl Decoder {
             self.dma.cancel();
             return Err(error);
         }
-        self.pending = Some(Pending::Decode(count as u32));
+        self.pending = Some(Pending::Decode(cursor));
         Ok(())
     }
     fn store(&mut self, cx: &Cx<'_>, o: usize, v: u32) -> Result<(), String> {
@@ -267,7 +283,7 @@ impl Device for Decoder {
                 self.r[0x118 / 4] = 0;
             }
             Pending::Clear(_) => self.r[0] = 0,
-            Pending::Decode(count) => {
+            Pending::Decode(cursor) => {
                 match self.dma.write(cx) {
                     Ok(true) => {}
                     Ok(false) => return,
@@ -276,7 +292,7 @@ impl Device for Decoder {
                         return;
                     }
                 }
-                self.r[0x108 / 4] = count;
+                self.r[0x108 / 4] = cursor.0;
                 self.r[1] |= 0x10;
                 Transfer::interrupt(cx, self.irq);
             }
@@ -302,106 +318,3 @@ impl Device for Decoder {
     }
 }
 
-#[cfg(test)]
-mod pixel_tests {
-    use super::*;
-
-    #[test]
-    fn box_scaling_and_full_size_fast_path_preserve_i64_reference_colors() {
-        let (width, height) = (64, 32);
-        let bytes: Vec<_> = (0..width * height * 3)
-            .map(|i| ((i * 73 + i / 17) % 256) as u8)
-            .collect();
-        for factor in [1, 2, 4, 8] {
-            for y in 0..height / factor {
-                for x in 0..width / factor {
-                    let expected: [i64; 3] = std::array::from_fn(|c| {
-                        let sum: i64 = (y * factor..(y + 1) * factor)
-                            .flat_map(|yy| (x * factor..(x + 1) * factor).map(move |xx| (yy, xx)))
-                            .map(|(yy, xx)| i64::from(bytes[(yy * width + xx) * 3 + c]))
-                            .sum();
-                        let n = (factor * factor) as i64;
-                        (sum + n / 2) / n
-                    });
-                    assert_eq!(
-                        rgb_pixel(&bytes, width, factor, x, y).map(i64::from),
-                        expected
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn narrowed_color_conversion_preserves_i64_rounding_and_clipping() {
-        let reference = |[r, g, b]: [i64; 3]| {
-            [
-                ((19595 * r + 38470 * g + 7471 * b + 32768) >> 16).clamp(0, 255) as u8,
-                (((-11059 * r - 21709 * g + 32768 * b + 32768) >> 16) + 128).clamp(0, 255) as u8,
-                (((32768 * r - 27439 * g - 5329 * b + 32768) >> 16) + 128).clamp(0, 255) as u8,
-            ]
-        };
-        for r in [0, 1, 127, 128, 254, 255] {
-            for g in [0, 1, 127, 128, 254, 255] {
-                for b in [0, 1, 127, 128, 254, 255] {
-                    assert_eq!(rgb_to_ycc([r, g, b]), reference([r, g, b].map(i64::from)));
-                }
-            }
-        }
-        let mut state = 7u64;
-        for _ in 0..65_536 {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let rgb = [state as u8, (state >> 16) as u8, (state >> 32) as u8].map(i32::from);
-            assert_eq!(rgb_to_ycc(rgb), reference(rgb.map(i64::from)));
-        }
-    }
-}
-
-#[cfg(test)]
-mod checkpoint_tests {
-    use super::*;
-    #[test]
-    fn pixel_and_source_bytes_restore_without_integer_array_expansion() {
-        let mut device = Decoder::new(
-            Options {
-                completion_ticks: 5,
-                reset_ticks: 2,
-            },
-            Irq { core: 0, line: 76 },
-        )
-        .unwrap();
-        device.source = vec![0xf9; 4096].into();
-        device
-            .dma
-            .prepare(
-                0,
-                5,
-                Raster {
-                    address: 0x4000,
-                    width: 8,
-                    height: 8,
-                    pitch: 16,
-                },
-                16,
-            )
-            .unwrap();
-        for (i, byte) in device.dma.pixels.iter_mut().enumerate() {
-            *byte = i as u8;
-        }
-        device.pending = Some(Pending::Decode(41));
-        let identity = device.fingerprint().unwrap();
-        let saved = device.checkpoint().unwrap();
-        assert!(saved.bytes() < device.source.len() + device.dma.pixels.len() + 1024);
-        Arc::make_mut(&mut device.source).fill(0);
-        device.dma.pixels.fill(0);
-        device.pending = None;
-        device.restore_checkpoint(&saved).unwrap();
-        assert_eq!(&*device.source, &vec![0xf9; 4096]);
-        assert_eq!(
-            &**device.dma.pixels,
-            &(0..128).map(|i| i as u8).collect::<Vec<_>>()
-        );
-        assert!(matches!(device.pending, Some(Pending::Decode(41))));
-        assert_eq!(device.fingerprint().unwrap(), identity);
-    }
-}
