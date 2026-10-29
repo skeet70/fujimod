@@ -13,18 +13,28 @@ pub struct Options {
     pub completion_ticks: u64,
     pub reset_ticks: u64,
 }
-/// 0x108 after completion: programmed 0x100 plus written bytes, in the 0x100 address domain.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-struct DestinationCursor(u32);
-impl DestinationCursor {
-    fn after(destination: u32, written: usize) -> Result<Self, String> {
-        let written = u32::try_from(written)
-            .map_err(|_| "JPEG decode output exceeds one register")?;
-        destination
-            .checked_add(written)
+/// Bytes one decode writes from 0x100, bounded by the 0x104 capacity.
+#[derive(Clone, Copy)]
+struct Extent(u32);
+impl Extent {
+    fn within(bytes: usize, capacity: u32) -> Option<Self> {
+        u32::try_from(bytes)
+            .ok()
+            .filter(|&n| n <= capacity)
             .map(Self)
-            .ok_or_else(|| "JPEG decode destination cursor overflows".into())
+    }
+}
+/// 0x108 after completion: raw 0x100, alias bits included, plus the written extent modulo 2^32.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DestinationCursor {
+    endpoint: u32,
+}
+impl DestinationCursor {
+    fn after(destination: u32, written: Extent) -> Self {
+        Self {
+            endpoint: destination.wrapping_add(written.0),
+        }
     }
 }
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -141,10 +151,12 @@ impl Decoder {
         let rows = (h + 7) & !7;
         let row_bytes = pitch * 2;
         let written = row_bytes * rows;
-        if written > capacity || src < dst + written as u64 && dst < src + count as u64 {
+        let Some(extent) = Extent::within(written, r[0x104 / 4])
+            .filter(|_| src >= dst + written as u64 || dst >= src + count as u64)
+        else {
             return Err("JPEG output exceeds allocation or overlaps input".into());
-        }
-        let cursor = DestinationCursor::after(destination, written)?;
+        };
+        let cursor = DestinationCursor::after(destination, extent);
         let size = decoder
             .output_buffer_size()
             .ok_or("JPEG output size unknown")?;
@@ -292,7 +304,7 @@ impl Device for Decoder {
                         return;
                     }
                 }
-                self.r[0x108 / 4] = cursor.0;
+                self.r[0x108 / 4] = cursor.endpoint;
                 self.r[1] |= 0x10;
                 Transfer::interrupt(cx, self.irq);
             }
@@ -318,3 +330,57 @@ impl Device for Decoder {
     }
 }
 
+#[cfg(test)]
+mod pixel_tests {
+    use super::*;
+
+    #[test]
+    fn box_scaling_and_full_size_fast_path_preserve_i64_reference_colors() {
+        let (width, height) = (64, 32);
+        let bytes: Vec<_> = (0..width * height * 3)
+            .map(|i| ((i * 73 + i / 17) % 256) as u8)
+            .collect();
+        for factor in [1, 2, 4, 8] {
+            for y in 0..height / factor {
+                for x in 0..width / factor {
+                    let expected: [i64; 3] = std::array::from_fn(|c| {
+                        let sum: i64 = (y * factor..(y + 1) * factor)
+                            .flat_map(|yy| (x * factor..(x + 1) * factor).map(move |xx| (yy, xx)))
+                            .map(|(yy, xx)| i64::from(bytes[(yy * width + xx) * 3 + c]))
+                            .sum();
+                        let n = (factor * factor) as i64;
+                        (sum + n / 2) / n
+                    });
+                    assert_eq!(
+                        rgb_pixel(&bytes, width, factor, x, y).map(i64::from),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn narrowed_color_conversion_preserves_i64_rounding_and_clipping() {
+        let reference = |[r, g, b]: [i64; 3]| {
+            [
+                ((19595 * r + 38470 * g + 7471 * b + 32768) >> 16).clamp(0, 255) as u8,
+                (((-11059 * r - 21709 * g + 32768 * b + 32768) >> 16) + 128).clamp(0, 255) as u8,
+                (((32768 * r - 27439 * g - 5329 * b + 32768) >> 16) + 128).clamp(0, 255) as u8,
+            ]
+        };
+        for r in [0, 1, 127, 128, 254, 255] {
+            for g in [0, 1, 127, 128, 254, 255] {
+                for b in [0, 1, 127, 128, 254, 255] {
+                    assert_eq!(rgb_to_ycc([r, g, b]), reference([r, g, b].map(i64::from)));
+                }
+            }
+        }
+        let mut state = 7u64;
+        for _ in 0..65_536 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let rgb = [state as u8, (state >> 16) as u8, (state >> 32) as u8].map(i32::from);
+            assert_eq!(rgb_to_ycc(rgb), reference(rgb.map(i64::from)));
+        }
+    }
+}
