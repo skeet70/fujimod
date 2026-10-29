@@ -41,6 +41,14 @@ fn configure(d: &mut Encoder, h: &mut TestHost, stream: bool) {
 // f17324773f37349248950a6d0f471e97b0a297ca5c8c21f25dc804ac78b53c8f.
 const JPEG_36X22: &[u8] = b"\xff\xd8\xff\xe0\x00\x10\x4a\x46\x49\x46\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00\xff\xdb\x00\x43\x00\x0d\x09\x0a\x0b\x0a\x08\x0d\x0b\x0a\x0b\x0e\x0e\x0d\x0f\x13\x20\x15\x13\x12\x12\x13\x27\x1c\x1e\x17\x20\x2e\x29\x31\x30\x2e\x29\x2d\x2c\x33\x3a\x4a\x3e\x33\x36\x46\x37\x2c\x2d\x40\x57\x41\x46\x4c\x4e\x52\x53\x52\x32\x3e\x5a\x61\x5a\x50\x60\x4a\x51\x52\x4f\xff\xc0\x00\x0b\x08\x00\x16\x00\x24\x01\x01\x11\x00\xff\xc4\x00\x15\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x06\xff\xc4\x00\x18\x10\x00\x03\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x15\x62\x03\x61\xff\xda\x00\x08\x01\x01\x00\x00\x3f\x00\x8a\x53\x21\x4c\x85\x32\x14\xc8\x53\x25\xe2\x99\x0a\x64\x29\x90\xa6\x42\x99\x2e\x57\x67\xc0\xbb\x3e\x05\xd9\xf0\x2e\xcf\x81\x76\x7c\x3f\xff\xd9";
 const JPEG_SOURCE: u64 = 0x9000;
+// Row samples of JPEG_36X22 from the same ImageMagick, `-define jpeg:dct-method=islow` to
+// `gray:-`. Every column of a row is equal; islow, ifast and float differ by at most 1.
+const LUMA_36X22: [u8; 22] = [
+    1, 10, 24, 36, 47, 60, 73, 83, 98, 108, 122, 134, 145, 157, 171, 181, 194, 206, 220, 232, 243,
+    253,
+];
+// That islow decode through `-filter box -resize 18x11!`.
+const LUMA_18X11: [u8; 11] = [6, 30, 54, 78, 103, 128, 151, 176, 200, 226, 248];
 fn jpeg_decoder() -> Decoder {
     Decoder::new(
         decoder::Options {
@@ -68,12 +76,15 @@ fn start_jpeg(d: &mut Decoder, h: &mut TestHost, destination: u32, capacity: u32
         write(d, h, 0xfff63000 + o, v);
     }
 }
-/// Pitch and row padding must be zero.
-fn assert_gray_packed422(out: &[u8], pitch: usize, width: usize, height: usize) {
+/// `luma` holds one value per decoded row, matched within 1; pitch and row padding must be zero.
+fn assert_gray_packed422(out: &[u8], pitch: usize, width: usize, luma: &[u8]) {
     for (y, row) in out.chunks_exact(pitch * 2).enumerate() {
         for (x, pair) in row.chunks_exact(4).enumerate() {
-            if y < height && x * 2 < width {
-                assert_eq!(&pair[2..], &[128, 128], "pair {x} row {y}");
+            if y < luma.len() && x * 2 < width {
+                assert_eq!(&pair[2..], &[128, 128], "chroma pair {x} row {y}");
+                for v in &pair[..2] {
+                    assert!(v.abs_diff(luma[y]) <= 1, "luma {v} pair {x} row {y}");
+                }
             } else {
                 assert_eq!(pair, &[0; 4], "padding pair {x} row {y}");
             }
@@ -240,7 +251,7 @@ fn jpeg_completion_cursor_is_the_padded_extent_of_the_programmed_destination() {
     let cursor = read(&mut d, &mut h, 0xfff63108);
     assert_eq!(cursor - programmed, 48 * 24 * 2);
     assert_eq!(read(&mut d, &mut h, 0xfff63110), JPEG_36X22.len() as u64);
-    assert_gray_packed422(&h.ram[0x80000..][..48 * 24 * 2], 48, 36, 22);
+    assert_gray_packed422(&h.ram[0x80000..][..48 * 24 * 2], 48, 36, &LUMA_36X22);
     assert_eq!(&h.ram[0x80000 + 48 * 24 * 2..][..4], &[0xa5; 4]);
 }
 
@@ -254,7 +265,7 @@ fn jpeg_downscale_cursor_uses_the_scaled_padded_extent() {
     advance(&mut d, &mut h, 5);
     assert_eq!(h.irqs, [(0, 76)]);
     assert_eq!(read(&mut d, &mut h, 0xfff63108) - 0x4008_1000, 32 * 16 * 2);
-    assert_gray_packed422(&h.ram[0x81000..][..32 * 16 * 2], 32, 18, 11);
+    assert_gray_packed422(&h.ram[0x81000..][..32 * 16 * 2], 32, 18, &LUMA_18X11);
     assert_eq!(&h.ram[0x81000 + 32 * 16 * 2..][..4], &[0xa5; 4]);
 }
 
@@ -275,7 +286,7 @@ fn jpeg_cursor_wraps_with_the_raw_alias_where_the_extent_ends_the_aperture() {
     let cursor = read(&mut d, &mut h, 0xfff63108) as u32;
     assert_eq!((programmed, cursor), (0xffff_f700, 0));
     assert_eq!(cursor.wrapping_sub(programmed), 48 * 24 * 2);
-    assert_gray_packed422(&h.ram[start..], 48, 36, 22);
+    assert_gray_packed422(&h.ram[start..], 48, 36, &LUMA_36X22);
 }
 
 #[test]
@@ -311,7 +322,7 @@ fn jpeg_checkpoint_resumes_the_pending_cursor_and_bytes_once() {
     assert_eq!(h.effects, ["dma", "irq"]);
     assert_eq!(h.irqs, [(0, 76)]);
     assert_eq!(d.next_deadline(5), None);
-    assert_gray_packed422(&h.ram[0x80000..][..48 * 24 * 2], 48, 36, 22);
+    assert_gray_packed422(&h.ram[0x80000..][..48 * 24 * 2], 48, 36, &LUMA_36X22);
     assert_eq!(&h.ram[0x80000 + 48 * 24 * 2..][..4], &[0xa5; 4]);
 }
 
@@ -365,7 +376,7 @@ fn checkpoint_holding_a_legacy_input_count_is_refused_and_the_job_completes_once
     assert_eq!(read(&mut d, &mut h, 0xfff63108), 0x4008_0000 + 48 * 24 * 2);
     assert_eq!(h.effects, ["dma", "irq"]);
     assert_eq!(h.irqs, [(0, 76)]);
-    assert_gray_packed422(&h.ram[0x80000..][..48 * 24 * 2], 48, 36, 22);
+    assert_gray_packed422(&h.ram[0x80000..][..48 * 24 * 2], 48, 36, &LUMA_36X22);
 }
 
 #[test]
@@ -386,7 +397,7 @@ fn reset_is_refused_while_pending_and_retains_the_completed_cursor() {
     let first = read(&mut d, &mut h, 0xfff63108);
     assert_eq!(first, 0x4008_0000 + 48 * 24 * 2);
     assert_eq!(h.irqs, [(0, 76)]);
-    assert_gray_packed422(&h.ram[0x80000..][..48 * 24 * 2], 48, 36, 22);
+    assert_gray_packed422(&h.ram[0x80000..][..48 * 24 * 2], 48, 36, &LUMA_36X22);
     write(&mut d, &mut h, 0xfff63004, 0x10);
     assert_eq!(read(&mut d, &mut h, 0xfff63004), 0);
     write(&mut d, &mut h, 0xfff63118, 1);
@@ -403,7 +414,7 @@ fn reset_is_refused_while_pending_and_retains_the_completed_cursor() {
     assert_eq!(read(&mut d, &mut h, 0xfff63108), 0x4008_1000 + 32 * 16 * 2);
     assert_eq!(read(&mut d, &mut h, 0xfff63004), 0x10010);
     assert_eq!(h.irqs, [(0, 76), (0, 76)]);
-    assert_gray_packed422(&h.ram[0x81000..][..32 * 16 * 2], 32, 18, 11);
+    assert_gray_packed422(&h.ram[0x81000..][..32 * 16 * 2], 32, 18, &LUMA_18X11);
 }
 
 #[test]
