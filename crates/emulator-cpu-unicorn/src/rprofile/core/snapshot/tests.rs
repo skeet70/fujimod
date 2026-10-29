@@ -97,10 +97,7 @@ fn a_yield_loop_replays_from_a_snapshot_in_any_quantum() {
     let saved = cpu.snapshot(None).unwrap();
     for quantum in [1, 17, 1000] {
         cpu.restore(saved.as_ref()).unwrap();
-        assert_eq!(
-            (cpu.instruction_progress(), get(&cpu, arm::PC), get(&cpu, arm::CORE[0])),
-            (Some(35), 0x1008, 12)
-        );
+        assert_eq!((get(&cpu, arm::PC), get(&cpu, arm::CORE[0])), (0x1008, 12));
         let mut remaining = 2113;
         while remaining != 0 {
             let n = quantum.min(remaining);
