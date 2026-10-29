@@ -635,6 +635,11 @@ impl Execution {
         {
             self.tighten(self.count.get())?;
         }
+        // Cortex-R4 executes YIELD as NOP (DDI 0363E 14.18). Unicorn's
+        // single-threaded TCG reports YIELD as an invalid instruction.
+        if yield_hint(word, size, thumb) {
+            return self.advance(address, size, cpsr);
+        }
         let hint = if thumb && size == 2 {
             match word {
                 0xbf20 => Some(Hint::WaitForEvent),
@@ -776,9 +781,16 @@ fn thumb_atomic(word: u32) -> bool {
 fn special(word: u32) -> bool {
     super::arm_irq_mask_source(word).is_some()
         || atomic(word)
-        || matches!(word & 0x0fff_ffff, 0x0320_f002..=0x0320_f004)
+        || matches!(word & 0x0fff_ffff, 0x0320_f001..=0x0320_f004)
         || coprocessor_boundary(word)
         || word & 0x0fe0_0f0f == 0x0c40_0f09
+}
+fn yield_hint(word: u32, size: u32, thumb: bool) -> bool {
+    match (thumb, size) {
+        (true, 2) => word == 0xbf10,
+        (true, _) => word.rotate_left(16) == 0xf3af_8001,
+        (false, _) => word >> 28 != 15 && word & 0x0fff_ffff == 0x0320_f001,
+    }
 }
 fn coprocessor_boundary(word: u32) -> bool {
     if word & 0x0f00_0010 != 0x0e00_0010 {

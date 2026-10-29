@@ -88,6 +88,31 @@ fn fractional_clock_pmu_banked_registers_and_block_ring_replay_exactly() {
 }
 
 #[test]
+fn a_yield_loop_replays_from_a_snapshot_in_any_quantum() {
+    let cpu = processor();
+    cpu.map_zeroed(0x1000, 0x1000, 7).unwrap();
+    words(&cpu, 0x1000, &[0xe2800001, 0xe320f001, 0xeafffffc]); // add r0,1; yield; b 1000
+    set(&cpu, arm::CPSR, 0xd3);
+    run(&cpu, 0x1000, 35).unwrap();
+    let saved = cpu.snapshot(None).unwrap();
+    for quantum in [1, 17, 1000] {
+        cpu.restore(saved.as_ref()).unwrap();
+        assert_eq!(
+            (cpu.instruction_progress(), get(&cpu, arm::PC), get(&cpu, arm::CORE[0])),
+            (Some(35), 0x1008, 12)
+        );
+        let mut remaining = 2113;
+        while remaining != 0 {
+            let n = quantum.min(remaining);
+            resume(&cpu, n).unwrap();
+            assert_eq!(cpu.instruction_progress(), Some(n as u64));
+            remaining -= n;
+        }
+        assert_eq!((get(&cpu, arm::PC), get(&cpu, arm::CORE[0])), (0x1000, 716));
+    }
+}
+
+#[test]
 fn both_tcm_banks_restore_bytes_and_swapped_windows_without_replacing_underlay() {
     let cpu = processor_with_options(
         &Memory::default(),

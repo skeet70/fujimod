@@ -1475,6 +1475,126 @@ fn hints_and_faults_have_entered_counts_and_unsupported_mechanisms_refuse() {
     }
 }
 
+#[test]
+fn yield_completes_as_one_entered_instruction_without_an_exit() {
+    for policy in [ExecutionPolicy::Exact, ExecutionPolicy::Interactive] {
+        let cpu = processor(&Memory::default());
+        cpu.map_zeroed(0x1000, 0x1000, 7).unwrap();
+        cpu.set_execution_policy(policy).unwrap();
+        // YIELD; YIELDEQ; YIELDNE; MOV r0,#42; WFI with Z set.
+        words(
+            &cpu,
+            0x1000,
+            &[0xe320f001, 0x0320f001, 0x1320f001, 0xe3a0002a, 0xe320f003],
+        );
+        set(&cpu, arm::CPSR, 0x4000_0053);
+        assert!(matches!(
+            run(&cpu, 0x1000, 100).unwrap(),
+            Exit::Hint(Hint::WaitForInterrupt)
+        ));
+        assert_eq!((get(&cpu, arm::PC), get(&cpu, arm::CORE[0])), (0x1014, 42));
+        match policy {
+            ExecutionPolicy::Exact => assert_eq!(cpu.instruction_progress(), Some(5)),
+            ExecutionPolicy::Interactive => assert!(cpu.instruction_progress().unwrap() >= 5),
+        }
+    }
+    let cpu = processor(&Memory::default());
+    cpu.map_zeroed(0x1000, 0x1000, 7).unwrap();
+    words(&cpu, 0x1000, &[0xe320f001, 0xe3a0002a, 0xe320f003]);
+    assert!(matches!(run(&cpu, 0x1000, 1).unwrap(), Exit::Stopped));
+    assert_eq!(
+        (cpu.instruction_progress(), get(&cpu, arm::PC), get(&cpu, arm::CORE[0])),
+        (Some(1), 0x1004, 0)
+    );
+    assert!(matches!(
+        resume(&cpu, 100).unwrap(),
+        Exit::Hint(Hint::WaitForInterrupt)
+    ));
+    assert_eq!(
+        (cpu.instruction_progress(), get(&cpu, arm::PC), get(&cpu, arm::CORE[0])),
+        (Some(2), 0x100c, 42)
+    );
+    for (halfwords, end) in [
+        (&[0xbf10_u16, 0xbf30][..], 0x1004),
+        (&[0xf3af, 0x8001, 0xf3af, 0x8003][..], 0x1008),
+    ] {
+        cpu.write_memory(
+            0x1000,
+            &halfwords
+                .iter()
+                .flat_map(|h| h.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(matches!(
+            run(&cpu, 0x1001, 100).unwrap(),
+            Exit::Hint(Hint::WaitForInterrupt)
+        ));
+        assert_eq!(
+            (cpu.instruction_progress(), get(&cpu, arm::PC)),
+            (Some(2), end)
+        );
+    }
+    // The unconditional-space neighbour is not YIELD; UDF stays undefined.
+    set(&cpu, arm::CPSR, 0x53);
+    words(&cpu, 0x1000, &[0xf320f001]);
+    assert!(run(&cpu, 0x1000, 1).is_err());
+    words(&cpu, 0x1000, &[0xe7f000f0]);
+    assert!(matches!(
+        run(&cpu, 0x1000, 1),
+        Err(ExecutionError::InvalidInstruction(_))
+    ));
+}
+
+#[test]
+fn a_yielding_peer_wait_resumes_in_bounded_quanta_until_the_peer_clears_its_cell() {
+    let backing = Backing::aligned_zeros(0x1000, 4096).unwrap();
+    let memory = Memory::default();
+    let waiter = processor(&memory);
+    let peer = processor(&memory);
+    for (cpu, code) in [(&waiter, 0x1000), (&peer, 0x3000)] {
+        cpu.map_zeroed(code, 0x1000, 7).unwrap();
+        unsafe {
+            cpu.map_backing(0x2000, 0x1000, 7, NonNull::new(backing.as_ptr()).unwrap())
+                .unwrap();
+        }
+        set(cpu, arm::CPSR, 0x53);
+        set(cpu, arm::CORE[0], 0x2000);
+    }
+    // ldr r2,[r0,#4]; cmp r2,r1; bne done; yield; b loop; done: WFI
+    words(
+        &waiter,
+        0x1000,
+        &[0xe5902004, 0xe1520001, 0x1a000001, 0xe320f001, 0xeafffffa, 0xe320f003],
+    );
+    words(&waiter, 0x2004, &[0x22b]);
+    set(&waiter, arm::CORE[1], 0x22b);
+    // mov r5,#0; str r5,[r0,#4]; WFI
+    words(&peer, 0x3000, &[0xe3a05000, 0xe5805004, 0xe320f003]);
+    assert!(matches!(run(&waiter, 0x1000, 7).unwrap(), Exit::Stopped));
+    assert_eq!(
+        (waiter.instruction_progress(), get(&waiter, arm::PC)),
+        (Some(7), 0x1008)
+    );
+    assert!(matches!(resume(&waiter, 10).unwrap(), Exit::Stopped));
+    assert_eq!(
+        (waiter.instruction_progress(), get(&waiter, arm::PC)),
+        (Some(10), 0x1008)
+    );
+    assert!(matches!(
+        run(&peer, 0x3000, 100).unwrap(),
+        Exit::Hint(Hint::WaitForInterrupt)
+    ));
+    assert!(matches!(
+        resume(&waiter, 100).unwrap(),
+        Exit::Hint(Hint::WaitForInterrupt)
+    ));
+    assert_eq!(
+        (waiter.instruction_progress(), get(&waiter, arm::PC)),
+        (Some(2), 0x1018)
+    );
+}
+
 unsafe fn sparse_entry(_: u64, _: u32, data: *mut c_void) {
     let calls = unsafe { &*data.cast::<Cell<u64>>() };
     calls.set(calls.get() + 1);
