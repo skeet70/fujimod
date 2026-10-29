@@ -1591,8 +1591,45 @@ fn a_yielding_peer_wait_resumes_in_bounded_quanta_until_the_peer_clears_its_cell
     ));
     assert_eq!(
         (waiter.instruction_progress(), get(&waiter, arm::PC)),
-        (Some(2), 0x1018)
+        (Some(7), 0x1018)
     );
+}
+
+#[test]
+fn a_passing_yield_inside_an_it_block_leaves_the_following_slot_conditional() {
+    for policy in [ExecutionPolicy::Exact, ExecutionPolicy::Interactive] {
+        let cpu = processor(&Memory::default());
+        cpu.map_zeroed(0x1000, 0x1000, 7).unwrap();
+        cpu.set_execution_policy(policy).unwrap();
+        // CMP r0,r0; ITE EQ; YIELD (EQ); MOVNE r1,#9; MOVS r2,#5; WFI
+        cpu.write_memory(
+            0x1000,
+            &[0x80, 0x42, 0x0c, 0xbf, 0x10, 0xbf, 0x09, 0x21, 0x05, 0x22, 0x30, 0xbf],
+        )
+        .unwrap();
+        set(&cpu, arm::CPSR, 0x53);
+        set(&cpu, arm::CORE[1], 1);
+        assert!(matches!(run(&cpu, 0x1001, 3).unwrap(), Exit::Stopped));
+        assert_eq!(
+            (cpu.instruction_progress(), get(&cpu, arm::PC)),
+            (Some(3), 0x1006)
+        );
+        assert_ne!(get(&cpu, arm::CPSR) & 0x0600_fc00, 0);
+        assert!(matches!(
+            resume(&cpu, 100).unwrap(),
+            Exit::Hint(Hint::WaitForInterrupt)
+        ));
+        assert_eq!(
+            (
+                cpu.instruction_progress(),
+                get(&cpu, arm::PC),
+                get(&cpu, arm::CORE[1]),
+                get(&cpu, arm::CORE[2]),
+                get(&cpu, arm::CPSR) & 0x0600_fc00,
+            ),
+            (Some(3), 0x100c, 1, 5, 0)
+        );
+    }
 }
 
 unsafe fn sparse_entry(_: u64, _: u32, data: *mut c_void) {
