@@ -60,6 +60,8 @@ impl Library {
             translation: RefCell::new(None),
             thumb_metadata: Rc::new(Cell::new(false)),
             callback_error: Rc::new(RefCell::new(None)),
+            memory_access: Rc::new(Cell::new(None)),
+            refused_access: Cell::new(None),
             inspection: Rc::new(Inspection::default()),
             run_until: Cell::new(None),
             memory_regions: RefCell::new(None),
@@ -111,6 +113,10 @@ pub struct Core {
     translation: RefCell<Option<Box<TranslationHooks>>>,
     thumb_metadata: Rc<Cell<bool>>,
     callback_error: Rc<RefCell<Option<String>>>,
+    // The access observed by the running Hook::Memory callback.
+    memory_access: Rc<Cell<Option<MemoryAccess>>>,
+    // The access refused in the current run.
+    refused_access: Cell<Option<MemoryAccess>>,
     inspection: Rc<Inspection>,
     run_until: Cell<Option<u64>>,
     memory_regions: RefCell<Option<Vec<MemoryRegion>>>,
@@ -216,10 +222,16 @@ struct StoredHook {
     native: usize,
     _context: Box<HookData>,
 }
+#[derive(Clone, Copy)]
+struct MemoryAccess {
+    access: DataAccess,
+    address: PhysicalAddress,
+}
 struct HookData {
     hook: Hook,
     thumb_metadata: Rc<Cell<bool>>,
     error: Rc<RefCell<Option<String>>>,
+    memory_access: Rc<Cell<Option<MemoryAccess>>>,
     api: Rc<ffi::Api>,
 }
 impl HookData {
@@ -480,6 +492,8 @@ impl Cpu for Core {
             watched_stores: e.hook_watched.is_some() && e.watch.is_some(),
             backing_observation: e.observe_backings.is_some(),
             store_pc_control: e.write_hook_pc_sync.is_some(),
+            access_refusal: e.refuse_access.is_some()
+                && e.features & ffi::FEATURE_ACCESS_REFUSAL != 0,
         }
     }
     fn read_register(&self, register: Register, out: &mut [u8]) -> Result<usize, String> {
@@ -668,6 +682,7 @@ impl Cpu for Core {
             self.run_until.set(request.until);
         }
         self.callback_error.borrow_mut().take();
+        self.refused_access.set(None);
         let status = unsafe {
             (self.api.uc_emu_start)(
                 self.raw,
@@ -679,6 +694,11 @@ impl Cpu for Core {
         };
         if let Some(error) = self.callback_error.borrow_mut().take() {
             return Err(ExecutionError::Backend(error));
+        }
+        if status == ffi::ERR_EMBEDDER_REFUSED
+            && let Some(MemoryAccess { access, address }) = self.refused_access.take()
+        {
+            return Err(ExecutionError::AccessRefused { access, address });
         }
         if let Err(message) = self.check(status) {
             // A faulting access leaves the PC at the instruction that made it.
@@ -720,6 +740,26 @@ impl Cpu for Core {
     }
     fn stop(&self) -> Result<(), String> {
         self.check(unsafe { (self.api.uc_emu_stop)(self.raw) })
+    }
+    fn refuse_access(&self) -> Result<(), AccessRefusalError> {
+        let refuse = self
+            .api
+            .extensions
+            .refuse_access
+            .filter(|_| self.features().access_refusal)
+            .ok_or(AccessRefusalError::Unsupported)?;
+        let access = self
+            .memory_access
+            .get()
+            .ok_or(AccessRefusalError::OutsideMemoryHook)?;
+        match unsafe { refuse(self.raw) } {
+            0 => {
+                self.refused_access.set(Some(access));
+                Ok(())
+            }
+            ffi::ERR_MODE => Err(AccessRefusalError::UnsupportedExecutionMode),
+            _ => Err(AccessRefusalError::OutsideMemoryHook),
+        }
     }
     fn snapshot(&self, _previous: Option<&dyn Snapshot>) -> Result<Box<dyn Snapshot>, String> {
         let mut raw = std::ptr::null_mut();
@@ -784,6 +824,7 @@ impl Cpu for Core {
             hook,
             thumb_metadata: self.thumb_metadata.clone(),
             error: self.callback_error.clone(),
+            memory_access: self.memory_access.clone(),
             api: self.api.clone(),
         });
         let (begin, end) = range(span);
@@ -992,9 +1033,20 @@ unsafe extern "C" fn memory(
         }
     };
     if let Hook::Memory { callback, data, .. } = context.hook {
+        let observed = match access {
+            Access::Read => Some(DataAccess::Read),
+            Access::Write => Some(DataAccess::Write),
+            Access::Fetch => None,
+        }
+        .map(|access| MemoryAccess {
+            access,
+            address: PhysicalAddress(address),
+        });
+        let outer = context.memory_access.replace(observed);
         unsafe {
             callback(access, address, size, value, data);
         }
+        context.memory_access.set(outer);
     }
 }
 unsafe extern "C" fn fault(
@@ -1491,5 +1543,104 @@ mod tests {
                 (Access::Write, 0x801024, 4, 0x12345678)
             ]
         );
+    }
+    struct Refusal {
+        cpu: *const dyn Cpu,
+        outcome: Option<Result<(), AccessRefusalError>>,
+    }
+    unsafe fn refuse_observed_access(_: Access, _: u64, _: i32, _: i64, data: *mut c_void) {
+        let refusal = unsafe { &mut *data.cast::<Refusal>() };
+        refusal.outcome = Some(unsafe { &*refusal.cpu }.refuse_access());
+    }
+    struct RefusedStore {
+        refusal: Option<Result<(), AccessRefusalError>>,
+        run: Result<Exit, ExecutionError>,
+        word: u32,
+    }
+    /// Runs `str r0, [r1]` of 0x11111111 to zeroed 0x4000 under a refusing
+    /// write hook.
+    fn refused_store(configure: impl FnOnce(&Core)) -> RefusedStore {
+        let cpu = library().open(Model::CortexR5F, 1024 * 1024).unwrap();
+        configure(&cpu);
+        cpu.map_zeroed(0x1000, 0x1000, 7).unwrap();
+        cpu.map_zeroed(0x4000, 0x1000, 3).unwrap();
+        cpu.write_memory(0x1000, &0xe5810000u32.to_le_bytes())
+            .unwrap();
+        cpu.write_register(arm::CORE[0], &0x11111111u32.to_le_bytes())
+            .unwrap();
+        cpu.write_register(arm::CORE[1], &0x4000u32.to_le_bytes())
+            .unwrap();
+        let mut refusal = Box::new(Refusal {
+            cpu: &cpu as &dyn Cpu,
+            outcome: None,
+        });
+        unsafe {
+            cpu.install_hook(Hook::Memory {
+                callback: refuse_observed_access,
+                data: (&mut *refusal as *mut Refusal).cast(),
+                read: false,
+                write: true,
+                range: HookRange::All,
+            })
+        }
+        .unwrap();
+        let run = cpu.run(Run {
+            begin: 0x1000,
+            until: None,
+            watchdog_us: 0,
+            instructions: Some(1),
+        });
+        let mut word = [0; 4];
+        cpu.read_memory(0x4000, &mut word).unwrap();
+        RefusedStore {
+            refusal: refusal.outcome,
+            run,
+            word: u32::from_le_bytes(word),
+        }
+    }
+    #[test]
+    fn access_refusal_requires_per_access_exits_and_serial_translation() {
+        let modes: [fn(&Core); 2] = [
+            |cpu| cpu.set_block_exits(true).unwrap(),
+            |cpu| cpu.set_parallel_cpus(true).unwrap(),
+        ];
+        for configure in modes {
+            let store = refused_store(configure);
+            assert_eq!(
+                store.refusal,
+                Some(Err(AccessRefusalError::UnsupportedExecutionMode))
+            );
+            assert!(matches!(store.run, Ok(Exit::Stopped)), "{:?}", store.run);
+            assert_eq!(store.word, 0x11111111);
+        }
+        let store = refused_store(|_| {});
+        assert_eq!(store.refusal, Some(Ok(())));
+        assert!(
+            matches!(
+                store.run,
+                Err(ExecutionError::AccessRefused {
+                    access: DataAccess::Write,
+                    address: PhysicalAddress(0x4000),
+                })
+            ),
+            "{:?}",
+            store.run
+        );
+        assert_eq!(store.word, 0);
+    }
+    #[test]
+    fn rprofile_core_does_not_offer_raw_access_refusal() {
+        let raw = library().open(Model::CortexR5F, 1024 * 1024).unwrap();
+        assert!(raw.features().access_refusal);
+        let cpu = rprofile::core::Core::new(
+            raw,
+            rprofile::core::Options::default(),
+            rprofile::core::Wiring {
+                memory: rprofile::memory::Memory::default(),
+            },
+        )
+        .unwrap();
+        assert!(!cpu.features().access_refusal);
+        assert_eq!(cpu.refuse_access(), Err(AccessRefusalError::Unsupported));
     }
 }
